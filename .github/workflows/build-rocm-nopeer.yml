@@ -14,9 +14,17 @@ jobs:
       - name: Clone llama.cpp b10453
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           git clone https://github.com/ggml-org/llama.cpp.git llama.cpp
-          cd llama.cpp
+          Set-Location llama.cpp
           git checkout 3cb7ffb1a
+
+          $commit = (git rev-parse HEAD).Trim()
+          Write-Host "llama.cpp commit: $commit"
+          if (-not $commit.StartsWith("3cb7ffb1a")) {
+            throw "Unexpected llama.cpp commit: $commit"
+          }
 
       - name: Setup ROCm 7.14
         shell: pwsh
@@ -24,19 +32,15 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           New-Item -Path "C:\TheRock\build" -ItemType Directory -Force | Out-Null
-
           python -m venv C:\TheRock\build\.venv
-
           & C:\TheRock\build\.venv\Scripts\Activate.ps1
 
           python -m pip install --upgrade pip
-
           python -m pip install `
             --index-url https://repo.amd.com/rocm/whl-multi-arch/ `
             "rocm[libraries,devel]==7.14.0"
 
           rocm-sdk init
-
           if ($LASTEXITCODE -ne 0) {
             throw "rocm-sdk init failed"
           }
@@ -50,11 +54,22 @@ jobs:
 
           $rocmPath = (rocm-sdk path --root).Trim()
           $binPath  = (rocm-sdk path --bin).Trim()
+          $clang    = Join-Path $rocmPath "lib\llvm\bin\clang.exe"
+          $clangxx  = Join-Path $rocmPath "lib\llvm\bin\clang++.exe"
 
-          Write-Host "ROCm root: $rocmPath"
-          Write-Host "ROCm bin : $binPath"
+          Write-Host "ROCm root : $rocmPath"
+          Write-Host "ROCm bin  : $binPath"
+          Write-Host "HIP clang : $clang"
+
+          if (-not (Test-Path $clang)) {
+            throw "ROCm clang.exe not found: $clang"
+          }
+          if (-not (Test-Path $clangxx)) {
+            throw "ROCm clang++.exe not found: $clangxx"
+          }
 
           "HIP_PATH=$rocmPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ROCM_PATH=$rocmPath" | Out-File -FilePath $env:GITHUB_ENV -Append
           "HIP_PLATFORM=amd" | Out-File -FilePath $env:GITHUB_ENV -Append
           "HIP_DEVICE_LIB_PATH=$rocmPath\lib\llvm\amdgcn\bitcode" | Out-File -FilePath $env:GITHUB_ENV -Append
           "LLVM_PATH=$rocmPath\lib\llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -62,17 +77,17 @@ jobs:
           $binPath | Out-File -FilePath $env:GITHUB_PATH -Append
           "C:\TheRock\build\.venv\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      - name: Configure
+      - name: Configure b10453 ROCm no-peer
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          cd llama.cpp
+          Set-Location llama.cpp
 
-          New-Item -ItemType Directory -Path build -Force | Out-Null
-          cd build
+          $clang   = "${env:HIP_PATH}\lib\llvm\bin\clang.exe"
+          $clangxx = "${env:HIP_PATH}\lib\llvm\bin\clang++.exe"
 
-          cmake .. `
+          cmake -S . -B build `
             -G "Unix Makefiles" `
             -DCMAKE_PREFIX_PATH="${env:HIP_PATH}" `
             -DCMAKE_BUILD_TYPE=Release `
@@ -81,9 +96,10 @@ jobs:
             -DGGML_CPU=ON `
             -DGGML_HIP=ON `
             -DGGML_CUDA_NO_PEER_COPY=ON `
-            -DCMAKE_C_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
-            -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang++.exe" `
-            -DCMAKE_HIP_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+            -DGGML_CCACHE=OFF `
+            -DCMAKE_C_COMPILER="$clang" `
+            -DCMAKE_CXX_COMPILER="$clangxx" `
+            -DCMAKE_HIP_COMPILER="$clang" `
             -DHIP_PATH="${env:HIP_PATH}" `
             "-DAMDGPU_TARGETS=gfx1101;gfx1201"
 
@@ -91,11 +107,37 @@ jobs:
             throw "CMake configure failed"
           }
 
+      - name: Verify ROCm architecture configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $cache = "llama.cpp\build\CMakeCache.txt"
+          if (-not (Test-Path $cache)) {
+            throw "CMakeCache.txt not found"
+          }
+
+          $cacheText = Get-Content $cache -Raw
+
+          Write-Host "=== Relevant CMake cache entries ==="
+          Get-Content $cache | Select-String -Pattern "AMDGPU_TARGETS|GPU_TARGETS|CMAKE_HIP_COMPILER|GGML_CUDA_NO_PEER_COPY|GGML_HIP"
+
+          if ($cacheText -notmatch "gfx1101") {
+            throw "gfx1101 is missing from CMake configuration"
+          }
+          if ($cacheText -notmatch "gfx1201") {
+            throw "gfx1201 is missing from CMake configuration"
+          }
+          if ($cacheText -notmatch "GGML_CUDA_NO_PEER_COPY:BOOL=ON") {
+            throw "GGML_CUDA_NO_PEER_COPY is not enabled"
+          }
+
       - name: Build
         shell: pwsh
         run: |
-          cd llama.cpp\build
+          $ErrorActionPreference = "Stop"
 
+          Set-Location llama.cpp\build
           cmake --build . --config Release --parallel 4
 
           if ($LASTEXITCODE -ne 0) {
@@ -105,6 +147,8 @@ jobs:
       - name: Verify HIP backend
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $hip = Get-ChildItem `
             -Path llama.cpp\build\bin `
             -Filter "ggml-hip*.dll" `
@@ -115,11 +159,24 @@ jobs:
             throw "ggml-hip.dll was not built"
           }
 
+          Write-Host "=== HIP backend ==="
           $hip | Format-Table FullName, Length
+
+          $server = Get-ChildItem `
+            -Path llama.cpp\build\bin `
+            -Filter "llama-server.exe" `
+            -Recurse `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if (-not $server) {
+            throw "llama-server.exe was not built"
+          }
 
       - name: Prepare artifact
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           New-Item -ItemType Directory -Path output -Force | Out-Null
 
           Copy-Item `
@@ -128,8 +185,19 @@ jobs:
             -Recurse `
             -Force
 
+          # Include the exact build configuration for troubleshooting/reproducibility.
+          Copy-Item "llama.cpp\build\CMakeCache.txt" "output\CMakeCache.txt" -Force
+
+          @(
+            "llama.cpp commit: 3cb7ffb1a (b10453)",
+            "ROCm: 7.14.0",
+            "AMDGPU_TARGETS: gfx1101;gfx1201",
+            "GGML_CUDA_NO_PEER_COPY: ON"
+          ) | Set-Content "output\BUILD-INFO.txt"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: llama-b10453-rocm714-nopeer
+          name: llama-b10453-rocm714-nopeer-gfx1101-gfx1201
           path: output
+          if-no-files-found: error
