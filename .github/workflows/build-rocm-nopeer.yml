@@ -1,0 +1,90 @@
+name: Build llama.cpp ROCm no-peer-copy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout llama.cpp b10453
+        shell: cmd
+        run: |
+          git clone https://github.com/ggml-org/llama.cpp.git llama.cpp
+          cd llama.cpp
+          git checkout 3cb7ffb1a
+
+      - name: Download ROCm 7.14 TheRock
+        shell: pwsh
+        run: |
+          $url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.14/therock-dist-windows-gfx110X-all-7.14.0rc3.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile therock.tar.gz
+          tar -xf therock.tar.gz
+
+          Get-ChildItem -Recurse -Filter clang.exe | Select-Object FullName
+          Get-ChildItem -Recurse -Filter amdhip64_7.dll | Select-Object FullName
+
+      - name: Locate ROCm
+        shell: pwsh
+        run: |
+          $clang = Get-ChildItem $PWD -Recurse -Filter clang.exe |
+            Where-Object { $_.FullName -match "lib\\llvm\\bin\\clang.exe$" } |
+            Select-Object -First 1
+
+          if (-not $clang) {
+            throw "clang.exe not found"
+          }
+
+          $llvmBin = $clang.Directory.FullName
+          $rocmRoot = Split-Path (Split-Path $llvmBin -Parent) -Parent
+
+          "ROCM_ROOT=$rocmRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LLVM_BIN=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Write-Host "ROCM_ROOT=$rocmRoot"
+          Write-Host "LLVM_BIN=$llvmBin"
+
+      - name: Configure
+        shell: cmd
+        run: |
+          cd llama.cpp
+
+          cmake -S . -B build ^
+            -G Ninja ^
+            -DGGML_HIP=ON ^
+            "-DGPU_TARGETS=gfx1101;gfx1201" ^
+            -DGGML_CUDA_NO_PEER_COPY=ON ^
+            -DGGML_CCACHE=OFF ^
+            -DCMAKE_C_COMPILER="%LLVM_BIN%\clang.exe" ^
+            -DCMAKE_CXX_COMPILER="%LLVM_BIN%\clang++.exe" ^
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: cmd
+        run: |
+          cd llama.cpp
+          cmake --build build -j 4
+
+      - name: Collect files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path output -Force
+
+          Copy-Item "llama.cpp\build\bin\*" output -Recurse
+
+          Copy-Item "$env:ROCM_ROOT\bin\*.dll" output -Force
+
+          if (Test-Path "$env:ROCM_ROOT\bin\rocblas") {
+            Copy-Item "$env:ROCM_ROOT\bin\rocblas" output\rocblas -Recurse
+          }
+
+          if (Test-Path "$env:ROCM_ROOT\.kpack") {
+            Copy-Item "$env:ROCM_ROOT\.kpack" output\.kpack -Recurse
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-b10453-rocm714-nopeer
+          path: output
