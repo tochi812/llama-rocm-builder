@@ -8,80 +8,125 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      - name: Checkout llama.cpp b10453
-        shell: cmd
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Clone llama.cpp b10453
+        shell: pwsh
         run: |
           git clone https://github.com/ggml-org/llama.cpp.git llama.cpp
           cd llama.cpp
           git checkout 3cb7ffb1a
 
-      - name: Download ROCm 7.14 TheRock
+      - name: Setup ROCm 7.14
         shell: pwsh
         run: |
-          $url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.14/therock-dist-windows-gfx110X-all-7.14.0rc3.tar.gz"
-          Invoke-WebRequest -Uri $url -OutFile therock.tar.gz
-          tar -xf therock.tar.gz
+          $ErrorActionPreference = "Stop"
 
-          Get-ChildItem -Recurse -Filter clang.exe | Select-Object FullName
-          Get-ChildItem -Recurse -Filter amdhip64_7.dll | Select-Object FullName
+          New-Item -Path "C:\TheRock\build" -ItemType Directory -Force | Out-Null
 
-      - name: Locate ROCm
-        shell: pwsh
-        run: |
-          $clang = Get-ChildItem $PWD -Recurse -Filter clang.exe |
-            Where-Object { $_.FullName -match "lib\\llvm\\bin\\clang.exe$" } |
-            Select-Object -First 1
+          python -m venv C:\TheRock\build\.venv
 
-          if (-not $clang) {
-            throw "clang.exe not found"
+          & C:\TheRock\build\.venv\Scripts\Activate.ps1
+
+          python -m pip install --upgrade pip
+
+          python -m pip install `
+            --index-url https://repo.amd.com/rocm/whl-multi-arch/ `
+            "rocm[libraries,devel]==7.14.0"
+
+          rocm-sdk init
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "rocm-sdk init failed"
           }
 
-          $llvmBin = $clang.Directory.FullName
-          $rocmRoot = Split-Path (Split-Path $llvmBin -Parent) -Parent
+      - name: Setup ROCm environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
 
-          "ROCM_ROOT=$rocmRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "LLVM_BIN=$llvmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & C:\TheRock\build\.venv\Scripts\Activate.ps1
 
-          Write-Host "ROCM_ROOT=$rocmRoot"
-          Write-Host "LLVM_BIN=$llvmBin"
+          $rocmPath = (rocm-sdk path --root).Trim()
+          $binPath  = (rocm-sdk path --bin).Trim()
+
+          Write-Host "ROCm root: $rocmPath"
+          Write-Host "ROCm bin : $binPath"
+
+          "HIP_PATH=$rocmPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "HIP_PLATFORM=amd" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "HIP_DEVICE_LIB_PATH=$rocmPath\lib\llvm\amdgcn\bitcode" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "LLVM_PATH=$rocmPath\lib\llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          $binPath | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\TheRock\build\.venv\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Append
 
       - name: Configure
-        shell: cmd
-        run: |
-          cd llama.cpp
-
-          cmake -S . -B build ^
-            -G Ninja ^
-            -DGGML_HIP=ON ^
-            "-DGPU_TARGETS=gfx1101;gfx1201" ^
-            -DGGML_CUDA_NO_PEER_COPY=ON ^
-            -DGGML_CCACHE=OFF ^
-            -DCMAKE_C_COMPILER="%LLVM_BIN%\clang.exe" ^
-            -DCMAKE_CXX_COMPILER="%LLVM_BIN%\clang++.exe" ^
-            -DCMAKE_BUILD_TYPE=Release
-
-      - name: Build
-        shell: cmd
-        run: |
-          cd llama.cpp
-          cmake --build build -j 4
-
-      - name: Collect files
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path output -Force
+          $ErrorActionPreference = "Stop"
 
-          Copy-Item "llama.cpp\build\bin\*" output -Recurse
+          cd llama.cpp
 
-          Copy-Item "$env:ROCM_ROOT\bin\*.dll" output -Force
+          New-Item -ItemType Directory -Path build -Force | Out-Null
+          cd build
 
-          if (Test-Path "$env:ROCM_ROOT\bin\rocblas") {
-            Copy-Item "$env:ROCM_ROOT\bin\rocblas" output\rocblas -Recurse
+          cmake .. `
+            -G "Unix Makefiles" `
+            -DCMAKE_PREFIX_PATH="${env:HIP_PATH}" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_CPU=ON `
+            -DGGML_HIP=ON `
+            -DGGML_CUDA_NO_PEER_COPY=ON `
+            -DCMAKE_C_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang++.exe" `
+            -DCMAKE_HIP_COMPILER="${env:HIP_PATH}\lib\llvm\bin\clang.exe" `
+            -DHIP_PATH="${env:HIP_PATH}" `
+            "-DAMDGPU_TARGETS=gfx1101;gfx1201"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed"
           }
 
-          if (Test-Path "$env:ROCM_ROOT\.kpack") {
-            Copy-Item "$env:ROCM_ROOT\.kpack" output\.kpack -Recurse
+      - name: Build
+        shell: pwsh
+        run: |
+          cd llama.cpp\build
+
+          cmake --build . --config Release --parallel 4
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed"
           }
+
+      - name: Verify HIP backend
+        shell: pwsh
+        run: |
+          $hip = Get-ChildItem `
+            -Path llama.cpp\build\bin `
+            -Filter "ggml-hip*.dll" `
+            -Recurse `
+            -ErrorAction SilentlyContinue
+
+          if (-not $hip) {
+            throw "ggml-hip.dll was not built"
+          }
+
+          $hip | Format-Table FullName, Length
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path output -Force | Out-Null
+
+          Copy-Item `
+            "llama.cpp\build\bin\*" `
+            "output\" `
+            -Recurse `
+            -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
