@@ -67,6 +67,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          Set-Location amd-hip-p2p-test
+
           $clang   = "${env:HIP_PATH}\lib\llvm\bin\clang.exe"
           $clangxx = "${env:HIP_PATH}\lib\llvm\bin\clang++.exe"
 
@@ -89,6 +91,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          Set-Location amd-hip-p2p-test
+
           $cache = "build\CMakeCache.txt"
           if (-not (Test-Path $cache)) {
             throw "CMakeCache.txt not found"
@@ -110,6 +114,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          Set-Location amd-hip-p2p-test
           cmake --build build --config Release --parallel 4
           if ($LASTEXITCODE -ne 0) {
             throw "Build failed"
@@ -119,6 +124,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+
+          Set-Location amd-hip-p2p-test
 
           $exe = Get-ChildItem `
             -Path build `
@@ -138,6 +145,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          Set-Location amd-hip-p2p-test
+
           New-Item -ItemType Directory -Path output -Force | Out-Null
 
           Copy-Item "build\amd-hip-p2p-test.exe" "output\" -Force
@@ -153,5 +162,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: amd-hip-p2p-test-windows-x64
-          path: output
+          path: amd-hip-p2p-test/output
           if-no-files-found: error
