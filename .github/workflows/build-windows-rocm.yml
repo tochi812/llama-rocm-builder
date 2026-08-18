@@ -1,0 +1,75 @@
+name: Build HIP P2P Test (Windows ROCm)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'amd-hip-p2p-test/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'amd-hip-p2p-test/**'
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        working-directory: amd-hip-p2p-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Download TheRock ROCm 7.14
+        shell: pwsh
+        run: |
+          $url = "https://github.com/ROCm/TheRock/releases/download/rocm-7.14-rc3/therock-dist-windows-multiarch-7.14.0.tar.gz"
+          $out = "$env:RUNNER_TEMP\rocm-7.14.tar.gz"
+          if (-not (Test-Path $out)) {
+            Write-Host "Downloading ROCm 7.14..."
+            Invoke-WebRequest -Uri $url -OutFile $out -MaximumRetryCount 3
+          }
+          Write-Host "Extracting ROCm 7.14..."
+          $dest = "$env:RUNNER_TEMP\rocm-7.14"
+          if (-not (Test-Path $dest)) {
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+            tar -xzf $out -C $dest
+          }
+          $rocmPath = (Get-ChildItem $dest -Directory | Select-Object -First 1).FullName
+          Write-Host "ROCM_PATH=$rocmPath"
+          "ROCM_PATH=$rocmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DROCM_PATH=%ROCM_PATH% ^
+            -DAMDGPU_TARGETS="gfx1101;gfx1201"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Verify binary
+        run: |
+          if (Test-Path "build\amd-hip-p2p-test.exe") {
+            Write-Host "Build succeeded: amd-hip-p2p-test.exe"
+          } else {
+            Write-Error "amd-hip-p2p-test.exe not found"
+            exit 1
+          }
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: amd-hip-p2p-test-windows-x64
+          path: amd-hip-p2p-test/build/amd-hip-p2p-test.exe
+          retention-days: 30
